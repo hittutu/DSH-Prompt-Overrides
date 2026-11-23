@@ -10,9 +10,18 @@ import { fileURLToPath } from 'node:url'
 
 export const name = 'prompt-overrides'
 
-// Match the services used by the shipped time-context plugin so this bundle
-// normally activates after the core agent/session services are ready.
-export const inject = ['agents', 'sessionProjections']
+// These services are the owners of the facts whose wording we replace. We do
+// not replace their enforcement or state; we only register scoped presenters.
+export const inject = [
+  'agents',
+  'sessionProjections',
+  'systemPrompt',
+  'workingDirectory',
+  'sandboxPolicy',
+  'approval',
+  'subagents',
+  'tools',
+]
 
 const DEFAULT_CONFIG_URL = new URL('./prompt-overrides.default.json', import.meta.url)
 const DISABLED_CONFIG = Object.freeze({
@@ -22,6 +31,9 @@ const DISABLED_CONFIG = Object.freeze({
   extraSections: [],
   extraContexts: [],
 })
+
+const APPROVAL_NEVER = 'Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).'
+const APPROVAL_ASK = 'Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.'
 
 function log(ctx, level, message, ...args) {
   const logger = ctx?.logger
@@ -66,10 +78,7 @@ function parseJsonishString(raw) {
 
 function extractVariables(name, originalText) {
   const original = String(originalText ?? '')
-  const variables = {
-    original,
-    variant: 'default',
-  }
+  const variables = { original, variant: 'default', additionalWritableRoots: '' }
 
   if (name === 'working-directory:current') {
     const match = original.match(/Current working directory:\s*(.+?)\.\s*$/s)
@@ -82,6 +91,10 @@ function extractVariables(name, originalText) {
       variables.policy = match[1].trim()
       variables.variant = variables.policy
     }
+    const workspace = original.match(/session workspace:\s*(\"(?:\\\\.|[^\"\\\\])*\"|[^.]+)\./s)
+    if (workspace) variables.workspaceRoot = parseJsonishString(workspace[1].trim())
+    const additional = original.match(/Additional writable directories:\s*(.+?)\.\s*On Windows/s)
+    if (additional) variables.additionalWritableRoots = additional[1]
   }
 
   if (name === 'approval:policy') {
@@ -95,14 +108,31 @@ function extractVariables(name, originalText) {
   }
 
   if (name === 'subagent:identity') {
-    const match = original.match(/You are the\s+(.+?)\s+agent\.\s+Your name is\s+(.+?)\.(?:\n|$)/s)
-    if (match) {
-      variables.agentRole = match[1].trim()
-      variables.agentName = parseJsonishString(match[2])
-      variables.variant = variables.agentRole
+    const rootMatch = original.match(/^You are the root agent\. Your name is (.+?)\./s)
+    const childMatch = original.match(/^You are a subagent delegated by agent (.+?)\.\s*\nYour name is (.+?)\.\s*\nThe root agent of your collaboration tree is (.+?)\./s)
+
+    if (rootMatch) {
+      variables.agentRole = 'root'
+      variables.agentName = parseJsonishString(rootMatch[1])
+      variables.rootAgentName = variables.agentName
+      variables.parentAgentName = ''
+    } else if (childMatch) {
+      variables.agentRole = 'child'
+      variables.parentAgentName = parseJsonishString(childMatch[1])
+      variables.agentName = parseJsonishString(childMatch[2])
+      variables.rootAgentName = parseJsonishString(childMatch[3])
+    } else {
+      const legacyMatch = original.match(/You are the\s+(.+?)\s+agent\.\s+Your name is\s+(.+?)\.(?:\n|$)/s)
+      if (legacyMatch) {
+        variables.agentRole = legacyMatch[1].trim()
+        variables.agentName = parseJsonishString(legacyMatch[2])
+        variables.variant = variables.agentRole
+      }
     }
+
     const lines = original.split(/\r?\n/)
-    variables.communicationHelp = lines.slice(1).join('\n')
+    const identityLineCount = childMatch ? 3 : 1
+    variables.communicationHelp = lines.slice(identityLineCount).join('\n').trim()
   }
 
   if (name === 'harness:source') {
@@ -169,15 +199,90 @@ function templateFor(entry, variables) {
   return undefined
 }
 
-function renderOverride(config, name, originalText) {
+function renderOverride(config, contextName, originalText) {
   if (!config?.enabled) return undefined
-  const entry = config.overrides?.[name]
+  const entry = config.overrides?.[contextName]
   if (!entry || entry.enabled === false) return undefined
 
-  const variables = extractVariables(name, originalText)
+  const variables = extractVariables(contextName, originalText)
   const template = templateFor(entry, variables)
   if (template === undefined) return undefined
   return renderTemplate(template, variables)
+}
+
+function renderSandboxPolicy(policy) {
+  switch (policy.mode) {
+    case 'read-only':
+      return 'Current DSH file policy: read-only. Any available operation enforced by the DSH file sandbox cannot modify files in the standing mode. Do not refuse a required modification from this policy alone: try an available tool normally and follow any denial and escalation guidance it returns.'
+    case 'workspace-write': {
+      const additional = policy.additionalWritableRoots
+      const extra = additional === undefined
+        ? ''
+        : ` Additional writable directories: ${JSON.stringify(additional)}. On Windows, these additional grants apply to file tools only, not sandboxed processes.`
+      return `Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: ${JSON.stringify(policy.workspaceRoot)}.${extra} Some platform temporary areas may also be writable.`
+    }
+    case 'danger-full-access':
+      return 'Current DSH file policy: danger-full-access. The DSH file sandbox does not restrict file modifications by available operations.'
+    default:
+      return `Current DSH file policy: ${String(policy.mode)}.`
+  }
+}
+
+function renderApprovalPolicy(ctx, agent) {
+  const policy = ctx.approval.overrideOf(agent.session)
+    ?? ctx.approval.config?.policy
+    ?? 'ask'
+  return policy === 'never' ? APPROVAL_NEVER : APPROVAL_ASK
+}
+
+function renderSubagentIdentity(ctx, agent, assemblyContext) {
+  try {
+    const names = ctx.subagents.namesOf(agent)
+    let identity = names.parent === undefined
+      ? `You are the root agent. Your name is ${JSON.stringify(names.self)}.`
+      : `You are a subagent delegated by agent ${JSON.stringify(names.parent)}.\n`
+        + `Your name is ${JSON.stringify(names.self)}.\n`
+        + `The root agent of your collaboration tree is "lead".`
+
+    const scope = assemblyContext?.scope ?? agent
+    const toolSet = assemblyContext?.toolSet
+    const guidance = []
+
+    if (ctx.tools.get('send_message', scope, toolSet) !== undefined) {
+      guidance.push('To message other agents, use send_message({ agent: "<agent-name>", message: "..." }).')
+      if (names.parent !== undefined && ctx.get('agentTeams')?.isEnabled(agent) !== true) {
+        guidance.push('When you finish, use send_message to send a self-contained result to the agent that delegated you. '
+          + 'Message any agent as soon as a finding changes what it should do next; sending a message does not end your turn.')
+      }
+    }
+    if (ctx.tools.get('list_agents', scope, toolSet) !== undefined) {
+      guidance.push('Use list_agents({}) to find your collaborator agents and their names.')
+    }
+    if (guidance.length > 0) identity += '\n\n' + guidance.join('\n')
+    return identity
+  } catch (error) {
+    const rootUnavailable = typeof error === 'object' && error !== null
+      && error.name === 'SubagentError' && error.code === 'UNAUTHORIZED'
+    if (!rootUnavailable) throw error
+    return `Your agent id is ${JSON.stringify(agent.id)}. Your subagent tree root is unavailable. `
+      + 'Continue independent work; subagent discovery and messaging require an active root.'
+  }
+}
+
+function contextSourceText(ctx, agent, contextName, assemblyContext) {
+  const session = agent.session
+  switch (contextName) {
+    case 'working-directory:current':
+      return `Current working directory: ${JSON.stringify(ctx.workingDirectory.get(session))}.`
+    case 'sandbox:policy':
+      return renderSandboxPolicy(ctx.sandboxPolicy.resolve({ session }))
+    case 'approval:policy':
+      return renderApprovalPolicy(ctx, agent)
+    case 'subagent:identity':
+      return renderSubagentIdentity(ctx, agent, assemblyContext)
+    default:
+      return undefined
+  }
 }
 
 function sortSections(sections) {
@@ -189,12 +294,13 @@ function sortSections(sections) {
   })
 }
 
+// Only ordinary system sections are transformed here. Runtime contexts are
+// overridden at their owning registry scope below; changing their assembled
+// snapshot is insufficient because refreshContext() resolves their providers.
 function transformPresentation(result, config, ctx) {
   if (!result || !config?.enabled) return result
 
   let sections = Array.isArray(result.sections) ? result.sections : undefined
-  let contexts = Array.isArray(result.contexts) ? result.contexts : undefined
-
   if (sections) {
     sections = sections.map((section) => {
       const replacement = renderOverride(config, section?.name, section?.text)
@@ -218,24 +324,17 @@ function transformPresentation(result, config, ctx) {
     sections = sortSections(sections)
   }
 
+  let contexts = Array.isArray(result.contexts) ? [...result.contexts] : undefined
   if (contexts) {
-    contexts = contexts.map((context) => {
-      const replacement = renderOverride(config, context?.name, context?.text)
-      if (replacement === undefined) return context
-      return cloneWith(context, { text: replacement, interpolate: false })
-    })
-
+    // extraContexts are genuinely new contributions, so refreshContext() keeps
+    // them when no registered provider owns their names.
     for (const extra of config.extraContexts ?? []) {
       if (!extra || extra.enabled === false || !extra.name || extra.text == null) continue
       if (contexts.some((context) => context?.name === extra.name)) {
         log(ctx, 'warn', `extraContexts contains duplicate name ${JSON.stringify(extra.name)}; skipped`)
         continue
       }
-      contexts.push({
-        name: String(extra.name),
-        text: String(extra.text),
-        interpolate: false,
-      })
+      contexts.push({ name: String(extra.name), text: String(extra.text), interpolate: false })
     }
   }
 
@@ -252,7 +351,7 @@ function transformTimeMessage(message, config) {
   if (!entry || entry.enabled === false) return message
 
   const content = Array.isArray(message.content) ? message.content : []
-  const textIndex = content.findIndex((part) => part?.type === 'text')
+  const textIndex = content.findIndex(part => part?.type === 'text')
   if (textIndex < 0) return message
 
   const originalText = String(content[textIndex]?.text ?? '')
@@ -286,7 +385,6 @@ function transformPreStepDecision(decision, config) {
     if (transformed !== message) changed = true
     return transformed
   })
-
   return changed ? cloneWith(decision, { messages }) : decision
 }
 
@@ -323,7 +421,7 @@ function createConfigLoader(ctx, configPath) {
     try {
       const stat = statSync(configPath)
       stamp = `${stat.mtimeMs}:${stat.size}`
-    } catch (error) {
+    } catch {
       if (lastWarnedStamp !== 'missing') {
         log(ctx, 'warn', `config is unavailable at ${configPath}; using last known good config`)
         lastWarnedStamp = 'missing'
@@ -354,36 +452,107 @@ function createConfigLoader(ctx, configPath) {
   }
 }
 
+const CONTEXT_REGISTRATIONS = [
+  { name: 'working-directory:current', orderName: 'WORKING_DIRECTORY', required: true },
+  { name: 'sandbox:policy', orderName: 'SANDBOX_POLICY', required: false },
+  { name: 'approval:policy', orderName: 'APPROVAL_POLICY', required: false },
+  { name: 'subagent:identity', orderName: 'SUBAGENT_DELEGATION', required: true },
+]
+
+function installAgentOverrides(ctx, agent, loadConfig, loggerCtx) {
+  const disposers = []
+  try {
+    const scopedPrompt = agent.ctx.systemPrompt
+
+    for (const definition of CONTEXT_REGISTRATIONS) {
+      const dispose = scopedPrompt.context({
+        name: definition.name,
+        order: scopedPrompt.getContextOrder(definition.orderName),
+        required: definition.required,
+        interpolate: false,
+        text: (assemblyContext) => {
+          const original = contextSourceText(ctx, agent, definition.name, assemblyContext)
+          if (original === undefined) return ''
+          const replacement = renderOverride(loadConfig(), definition.name, original)
+          return replacement === undefined ? original : replacement
+        },
+      })
+      disposers.push(dispose)
+    }
+
+    // time-context is a durable message appended by a global prepended
+    // pre-step listener. Register this scoped prepended wrapper at agent/created
+    // time, after the global package has mounted, so it is the outer wrapper:
+    // await next() sees the newly appended snapshot and can clone it safely.
+    const disposeTimeContext = agent.ctx.on('agent/pre-step', async (_payload, next) => {
+      const decision = await next()
+      return transformPreStepDecision(decision, loadConfig())
+    }, { prepend: true })
+    disposers.push(disposeTimeContext)
+
+    return disposers
+  } catch (error) {
+    for (const dispose of disposers.reverse()) {
+      try { dispose?.() } catch {}
+    }
+    log(loggerCtx, 'error', `failed to install scoped overrides for agent ${agent.id}: %o`, error)
+    throw error
+  }
+}
+
 export function apply(ctx, pluginConfig = {}) {
   const configPath = resolveConfigPath(ctx, pluginConfig)
   ensureConfigFile(ctx, configPath)
   const loadConfig = createConfigLoader(ctx, configPath)
+  const perAgentDisposers = new Map()
 
   log(ctx, 'info', `editable prompt file: ${configPath}`)
 
-  // 1) System prompt sections + runtime contexts (tool:read and items 2-7).
-  // Never mutate DSH-owned presentation objects; always return cloned replacements.
+  // Ordinary system-prompt sections (tool:read, harness:source, app:web-surface).
   ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
     const result = await next()
     return transformPresentation(result, loadConfig(), ctx)
   })
 
-  // 2) time-context is a separate durable user-role snapshot produced at pre-step.
-  // Delegate first so the shipped plugin can append its reading, then replace only
-  // that sourced message by constructing fresh immutable objects.
-  ctx.on('agent/pre-step', async (_event, next) => {
-    const decision = await next()
-    return transformPreStepDecision(decision, loadConfig())
-  }, { prepend: true })
+  const install = (agent) => {
+    if (!agent || perAgentDisposers.has(agent)) return
+    const disposers = installAgentOverrides(ctx, agent, loadConfig, ctx)
+    perAgentDisposers.set(agent, disposers)
+    log(ctx, 'info', `installed scoped runtime-context overrides for agent ${agent.id}`)
+  }
+
+  // agent/created is serial and fires before the first prompt assembly.
+  ctx.on('agent/created', ({ agent }) => install(agent))
+  ctx.on('agent/disposed', ({ agent }) => { perAgentDisposers.delete(agent) })
+
+  // Also cover agents that were already live when this plugin was hot-loaded.
+  for (const agent of ctx.agents.list()) install(agent)
+
+  // Agent-scoped registrations are owned by agent.ctx, so explicitly dispose
+  // their exact handles if THIS plugin unloads before those Agents do.
+  ctx.effect(() => () => {
+    for (const disposers of perAgentDisposers.values()) {
+      for (const dispose of [...disposers].reverse()) {
+        try { dispose?.() } catch (error) {
+          log(ctx, 'warn', `scoped registration disposal failed: %o`, error)
+        }
+      }
+    }
+    perAgentDisposers.clear()
+  }, 'dsh-prompt-overrides.disposeAgentScopes()')
 }
 
-// Export pure helpers for the bundled self-test. They are not part of the DSH API.
 export const __test = {
   cloneWith,
   extractVariables,
   renderTemplate,
   renderOverride,
+  renderSandboxPolicy,
+  renderApprovalPolicy,
+  renderSubagentIdentity,
+  contextSourceText,
   transformPresentation,
   transformTimeMessage,
   transformPreStepDecision,
+  installAgentOverrides,
 }

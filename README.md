@@ -1,145 +1,76 @@
-# dsh-prompt-overrides
+# DSH Prompt Overrides
 
-A small DeepSeek Harness bundle for **safe, hot-reloadable wording overrides**.
+A small Cordis plugin for DeepSeek Harness that lets you rewrite model-visible prompt wording from one editable JSON file, without patching DSH Base or changing policy enforcement.
 
-It is deliberately boring:
+## What it changes
 
-- it does **not** patch DeepSeek Harness source files;
-- it does **not** mutate DSH-owned/frozen message objects;
-- it does **not** regex-rewrite the entire final prompt;
-- it does **not** replace execution policy (sandbox / approval); it only changes the model-visible wording;
-- all editable wording lives in one profile-local JSON file.
+- `tool:read`
+- `working-directory:current`
+- `sandbox:policy`
+- `approval:policy`
+- `subagent:identity`
+- `harness:source`
+- `app:web-surface`
+- `time-context`
 
-The bundle targets these prompt/context names:
+It also supports optional `extraSections` and `extraContexts`.
 
-1. `tool:read`
-2. `working-directory:current`
-3. `sandbox:policy`
-4. `approval:policy`
-5. `subagent:identity`
-6. `harness:source`
-7. `app:web-surface`
-8. `time-context`
+## Important implementation detail
 
-It also supports optional `extraSections` and `extraContexts` for your own instructions.
+The four runtime contexts (`working-directory:current`, `sandbox:policy`, `approval:policy`, `subagent:identity`) are registered as **per-Agent scoped providers** through `agent.ctx.systemPrompt.context()`. This is intentional: DSH refreshes registered runtime-context providers after the `system-prompt/assemble` presentation waterfall. Editing an assembled context snapshot alone can therefore be overwritten by the original provider.
 
-## Why this implementation is safe
+Ordinary system sections are transformed through `system-prompt/assemble` using cloned objects. No original/frozen object is mutated.
 
-Items 1–7 are transformed through DSH's documented `system-prompt/assemble` waterfall. The plugin calls `next()` first, then returns a **new presentation** containing cloned replacement objects. It never does `section.text = ...` or `message.content[0].text = ...` on framework-owned objects.
+`time-context` is a durable user-role snapshot added by DSH's `agent/pre-step` listener. This plugin installs a per-Agent prepended wrapper during `agent/created`, so the wrapper can inspect the downstream decision after the time-context provider has appended a new snapshot. It clones the message, content block, and source sections rather than mutating them.
 
-`time-context` is different: the shipped plugin appends it as a durable user-role snapshot during `agent/pre-step`. This bundle delegates first, recognizes only messages whose source is exactly `time-context`, and returns a new decision/message/content/source tree.
-
-If `prompt-overrides.json` temporarily contains invalid JSON, the plugin keeps the **last known good configuration**. If no valid configuration has ever loaded, it falls back to disabled/no-op behavior instead of breaking DSH.
+Historical time-context messages already committed to a Session are not rewritten. Only newly generated snapshots are transformed. The stock time-context plugin defaults to a 10-minute refresh interval, so a test performed shortly after a previous injection may not create a new snapshot to transform.
 
 ## Install from GitHub
 
-Put the files in this repository at the repo root, then install the repository into the DSH profile you actually use.
-
-CLI example:
+Publish this directory as the root of a GitHub repository, then install it with DSH:
 
 ```bash
-dsh plugin --profile <your-profile> add github:<your-user>/<your-repo>#<commit>
+dsh plugin --profile <profile-name> add github:<owner>/<repo>#<commit-sha>
 ```
 
-Pinning a commit is recommended.
+Pinning a commit is recommended for reproducible installs.
 
-This package is plain JavaScript and has no build/`prepare` step, so a GitHub install does not need a source-build stage.
+## Editable configuration
 
-You can also use the DSH Plugin Manager UI and choose **Install a third-party plugin**, then provide the Git repository.
+On first activation the plugin creates `prompt-overrides.json` in the active DSH profile directory (or the configured absolute `configFile` path).
 
-## Editable file
+Edit that file; the plugin checks its modification time and reloads valid JSON on the next prompt assembly / runtime-context render. The installed package's default JSON is only a seed and is not copied over an existing user file during upgrades.
 
-On first load the plugin creates:
-
-```text
-<DSH profile directory>/prompt-overrides.json
-```
-
-The startup log prints the exact path:
-
-```text
-[dsh-prompt-overrides] editable prompt file: ...
-```
-
-Edit that JSON file, save it, and the plugin reloads it on the next prompt assembly / pre-step when the file mtime changes. No source edit is needed, and updating the GitHub plugin will not overwrite the profile-local file.
-
-> JSON has no comments and no trailing commas.
+If the JSON becomes invalid, the plugin keeps the last successfully parsed configuration. If no valid configuration has ever been loaded, it fails open and leaves original wording unchanged.
 
 ## Template variables
 
-Every override can use `{{original}}`.
+Templates use `{{variable}}` placeholders. Available values depend on the item:
 
-Known names also expose:
+- `working-directory:current`: `cwd`
+- `sandbox:policy`: `policy`, `workspaceRoot`, `additionalWritableRoots`
+- `approval:policy`: `approvalMode`
+- `subagent:identity`: `agentRole`, `agentName`, `parentAgentName`, `rootAgentName`, `communicationHelp`
+- `harness:source`: `sourceRoot`
+- `app:web-surface`: `webUrl`
+- `time-context`: `turn`, `step`, `timestamp`, `browserContext`, `baseline`, `baselineZh`, `elapsed`
 
-| Name | Variables |
-|---|---|
-| `working-directory:current` | `{{cwd}}` |
-| `sandbox:policy` | `{{policy}}` |
-| `approval:policy` | `{{approvalMode}}` (`ask` / `never`) |
-| `subagent:identity` | `{{agentRole}}`, `{{agentName}}`, `{{communicationHelp}}` |
-| `harness:source` | `{{sourceRoot}}` |
-| `app:web-surface` | `{{webUrl}}` |
-| `time-context` | `{{turn}}`, `{{step}}`, `{{timestamp}}`, `{{browserContext}}`, `{{baseline}}`, `{{baselineZh}}`, `{{elapsed}}`, `{{original}}` |
+For `sandbox:policy` and `approval:policy`, the `variants` key is selected from the actual active policy. Keep the wording truthful: this plugin changes what the model reads, not the sandbox or approval services that enforce actions.
 
-Unknown placeholders are left literally in the result. Overridden DSH sections/contexts are returned with `interpolate: false`, so those literals will not accidentally become DSH prompt-variable references.
+## Safety properties
 
-## Variants
+- Does not edit DSH Base files.
+- Does not mutate `decision.messages`, `message.content`, source sections, or prompt section/context objects.
+- Uses Agent-scoped registrations for runtime contexts, preserving their original `required` flags.
+- Keeps actual sandbox and approval enforcement unchanged.
+- Removes its Agent-scoped registrations when the plugin unloads; registrations are also owned by the Agent scope and unwind on Agent disposal.
+- Does not rewrite existing Session history.
+- Keeps the last valid JSON configuration if the editable file is temporarily malformed.
 
-An entry may use `variants` instead of one `text` string.
-
-The default config uses variants for:
-
-- `sandbox:policy`: selected by the actual policy name such as `danger-full-access`;
-- `approval:policy`: selected as `ask` or `never`.
-
-Always include a `default` variant if you want graceful behavior for future DSH values.
-
-## Extra instructions
-
-The default JSON includes a disabled example section named:
-
-```text
-custom:dsh-construction-manual
-```
-
-Flip its `enabled` field to `true` if you want the ten-step construction rules injected as an ordinary system-prompt section.
-
-You may add more entries to `extraSections` or `extraContexts`. Existing names are not silently replaced by the `extra*` lists; duplicate names are skipped with a warning. Use `overrides` for existing DSH names.
-
-## Recovery / disable
-
-The normal uninstall path is:
-
-```bash
-dsh plugin --profile <your-profile> remove dsh-prompt-overrides
-```
-
-If you only want to stop wording changes, set the profile-local JSON to:
-
-```json
-{
-  "version": 1,
-  "enabled": false,
-  "overrides": {},
-  "extraSections": [],
-  "extraContexts": []
-}
-```
-
-Because parse failures retain the last good configuration, intentionally breaking the JSON is **not** a disable mechanism.
-
-## Self-test
-
-From a checkout of this repository:
+## Test
 
 ```bash
 npm test
 ```
 
-The test deep-freezes representative prompt presentations and `time-context` messages, then verifies that all replacements happen by cloning rather than mutation.
-
-## Important semantic boundary
-
-This plugin changes **model-visible wording only**.
-
-For example, replacing the prose of `sandbox:policy` does not change the real sandbox policy, and replacing the prose of `approval:policy` does not change whether approvals are enabled. Keep your wording truthful to the actual runtime state.
+The included tests use frozen objects and mocked Cordis contexts. They verify the transformation logic and registration contracts; they are not a live test against a user's DSH process. A first live smoke test should use a fresh test session.
