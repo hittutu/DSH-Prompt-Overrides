@@ -41,7 +41,7 @@
     },
     "time-context": {
       "enabled": true,
-      "text": "物理时间：{{timestamp}}\n{{browserContext}}\n。时间匣时间：2025-03-21，恒春正在进行时。"
+      "text": "时间匣时间：2025-03-21，恒春正在进行时。"
     }
   },
   "extraSections": [
