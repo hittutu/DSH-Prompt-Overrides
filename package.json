@@ -1,0 +1,31 @@
+{
+  "name": "dsh-prompt-overrides",
+  "version": "0.1.0",
+  "description": "Safe, hot-reloadable prompt wording overrides for DeepSeek Harness.",
+  "type": "module",
+  "main": "index.js",
+  "exports": "./index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "prompt-overrides.default.json",
+    "README.md",
+    "self-test.mjs"
+  ],
+  "scripts": {
+    "test": "node self-test.mjs"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "prompt"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

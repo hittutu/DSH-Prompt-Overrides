@@ -1,0 +1,5 @@
+- insert:
+    - id: prompt-overrides
+      name: dsh-prompt-overrides
+      config:
+        configFile: prompt-overrides.json
